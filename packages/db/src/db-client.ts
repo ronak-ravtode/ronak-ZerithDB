@@ -161,6 +161,11 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
     }
   }
 
+  /** Alias for {@link clearAll} */
+  async clear(): Promise<void> {
+    return this.clearAll();
+  }
+
   /**
    * Count documents matching a filter.
    */

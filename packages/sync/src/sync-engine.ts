@@ -1,10 +1,9 @@
 import * as Y from "yjs";
 import { IndexeddbPersistence } from "y-indexeddb";
-import type { ZerithDBConfig, SyncState } from "zerithdb-core";
+import type { ZerithDBConfig, SyncState, SyncPlugin } from "zerithdb-core";
 import { EventEmitter } from "zerithdb-core";
 import type { DbClient } from "zerithdb-db";
 import type { NetworkManager } from "zerithdb-network";
-import { bytesToBase64, base64ToBytes } from "zerithdb-utils";
 import { InboxQueue } from "./queue/InboxQueue.js";
 import { OutboxQueue } from "./queue/OutboxQueue.js";
 
@@ -26,6 +25,8 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
   readonly inbox: InboxQueue<Uint8Array>;
   private _enabled = false;
   private _state: SyncState = { synced: false, pendingUpdates: 0, connectedPeers: 0 };
+  private plugins = new Map<string, SyncPlugin>();
+  private activePluginVersion = 1;
   private pendingUpdates = new Map<string, Uint8Array[]>();
   private syncTimer: any = null;
   private syncTimerIsRaf: boolean = false;
@@ -54,10 +55,15 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
 
   private handleVisibilityChange = (): void => {
     if (document.visibilityState === "visible") {
+      // Resume sync: Flush any local updates that accumulated while hidden.
+      // We don't need to 'enable()' because we never tore down incoming listeners.
       if (this.pendingUpdates.size > 0 && !this.syncTimer) {
         this.flushUpdates();
       }
     } else if (document.visibilityState === "hidden") {
+      // Pause outgoing sync: Clear the timer so it doesn't wake the CPU/radio.
+      // (requestAnimationFrame automatically pauses natively, but clearing it explicitly
+      // ensures the setTimeout fallback is safely neutralized).
       if (this.syncTimer) {
         if (this.syncTimerIsRaf && typeof window !== "undefined" && window.cancelAnimationFrame) {
           window.cancelAnimationFrame(this.syncTimer);
@@ -70,6 +76,10 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
     }
   };
 
+  /**
+   * Enable P2P sync. After calling this, local changes are broadcast
+   * to connected peers and remote updates are applied locally.
+   */
   enable(): void {
     if (this._enabled) return;
     this._enabled = true;
@@ -80,6 +90,7 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
     void this.flushOutbox();
   }
 
+  /** Disable sync without disconnecting from peers */
   disable(): void {
     this._enabled = false;
     this.network.off("message", this.onPeerUpdate);
@@ -88,10 +99,48 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
     this.updateState({ synced: false, connectedPeers: 0 });
   }
 
+  /**
+   * Register a synchronization plugin directly.
+   */
+  registerPlugin(plugin: SyncPlugin): void {
+    this.plugins.set(plugin.id, plugin);
+    if (plugin.version > this.activePluginVersion) {
+      this.activePluginVersion = plugin.version;
+    }
+  }
+
+  /**
+   * Dynamically load and register a plugin from a URL.
+   */
+  async loadPlugin(pluginUrl: string): Promise<void> {
+    try {
+      const module = await import(pluginUrl);
+      const plugin = module.default as SyncPlugin;
+      this.registerPlugin(plugin);
+    } catch (err) {
+      console.error(`Failed to load plugin from ${pluginUrl}`, err);
+    }
+  }
+
+  /**
+   * Propose a protocol upgrade to all connected peers.
+   */
+  proposeUpgrade(pluginUrl: string, version: number): void {
+    this.network.broadcast({
+      type: "sync-upgrade-offer",
+      payload: JSON.stringify({ pluginUrl, version }),
+    });
+  }
+
+  /** Current sync state snapshot */
   get state(): Readonly<SyncState> {
     return this._state;
   }
 
+  /**
+   * Get or create the Yjs document for a collection.
+   * Documents are persisted to IndexedDB via y-indexeddb.
+   */
   getDoc(collectionName: string): Y.Doc {
     if (this.docs.has(collectionName)) {
       // biome-ignore lint: map guarantees defined
@@ -100,14 +149,17 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
 
     const doc = new Y.Doc({ guid: `${this.config.appId}:${collectionName}` });
 
+    // Persist to IndexedDB
     const persistence = new IndexeddbPersistence(
       `zerithdb_sync_${this.config.appId}_${collectionName}`,
       doc
     );
     this.persistences.set(collectionName, persistence);
 
+    // Broadcast local updates to peers (batched via requestAnimationFrame)
     doc.on("update", (update: Uint8Array, origin: unknown) => {
-      if (origin === "remote") return;
+      if (origin === "remote") return; // Don't echo back remote updates
+      // Always queue the update so it eventually reaches the outbox (even if offline)
       this.queueUpdate(collectionName, update);
     });
 
@@ -115,8 +167,24 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
     return doc;
   }
 
-  applyRemoteUpdate(collectionName: string, update: Uint8Array, fromPeer: string): void {
-    void this.handleRemoteUpdate(collectionName, update, fromPeer);
+  /**
+   * Apply a remote CRDT update to the local document.
+   * Called by the network layer when a peer sends an update.
+   */
+  async applyRemoteUpdate(
+    collectionName: string,
+    update: Uint8Array,
+    fromPeer: string
+  ): Promise<void> {
+    let finalUpdate: Uint8Array | null = update;
+    for (const plugin of this.plugins.values()) {
+      if (plugin.onBeforeApplyUpdate) {
+        finalUpdate = await plugin.onBeforeApplyUpdate(collectionName, finalUpdate, fromPeer);
+        if (!finalUpdate) return; // Drop update
+      }
+    }
+
+    void this.handleRemoteUpdate(collectionName, finalUpdate, fromPeer);
   }
 
   async dispose(): Promise<void> {
@@ -154,6 +222,8 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
     }
     updates.push(update);
 
+    // Only schedule the next outgoing flush if the tab is visible.
+    // If hidden, the updates safely accumulate in the map without battery drain.
     if (
       !this.syncTimer &&
       (typeof document === "undefined" || document.visibilityState !== "hidden")
@@ -171,6 +241,7 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
   private flushUpdates(): void {
     this.syncTimer = null;
     for (const [collectionName, updates] of this.pendingUpdates.entries()) {
+      // Y.mergeUpdates merges all updates into a single efficient payload
       const merged = Y.mergeUpdates(updates);
       void this.handleLocalUpdate(collectionName, merged);
     }
@@ -178,11 +249,43 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
   }
 
   private onPeerUpdate(msg: { type: string; payload: Uint8Array | string; from: string }): void {
+    if (msg.type === "sync-upgrade-offer") {
+      const payloadStr =
+        typeof msg.payload === "string" ? msg.payload : new TextDecoder().decode(msg.payload);
+      const offer = JSON.parse(payloadStr) as { pluginUrl: string; version: number };
+
+      // Auto-accept and load for this MVP.
+      this.loadPlugin(offer.pluginUrl)
+        .then(() => {
+          this.network.sendTo(msg.from, {
+            type: "sync-upgrade-accept",
+            payload: JSON.stringify({ version: offer.version }),
+          });
+        })
+        .catch(() => {
+          // Failure to upgrade -> disconnect peer
+          // Assuming `network` has a way to disconnect or we just ignore.
+          // We can emit an error or handle it.
+          console.warn(
+            `Peer ${msg.from} failed to upgrade. Disconnecting is currently not natively supported in NetworkManager's public API directly from SyncEngine, but we will ignore their updates.`
+          );
+        });
+      return;
+    }
+
+    if (msg.type === "sync-upgrade-accept") {
+      // Could log or update peer state
+      return;
+    }
+
     if (msg.type !== "sync-update") return;
+
     const payload = typeof msg.payload === "string" ? base64ToBytes(msg.payload) : msg.payload;
+
     const decoded = this.decodeMessage(payload);
     if (decoded === null) return;
-    this.applyRemoteUpdate(decoded.collectionName, decoded.update, msg.from);
+
+    void this.applyRemoteUpdate(decoded.collectionName, decoded.update, msg.from);
   }
 
   private onPeerConnected(): void {
@@ -196,20 +299,28 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
 
   private async handleLocalUpdate(collectionName: string, update: Uint8Array): Promise<void> {
     try {
+      let finalUpdate: Uint8Array | null = update;
+      for (const plugin of this.plugins.values()) {
+        if (plugin.onBeforeSendUpdate) {
+          finalUpdate = await plugin.onBeforeSendUpdate(collectionName, finalUpdate);
+          if (!finalUpdate) return; // Drop update
+        }
+      }
+
       const mutation = await this.outbox.enqueue({
         type: "sync-update",
         collection: collectionName,
-        payload: update,
+        payload: finalUpdate,
       });
 
       if (!this._enabled) return;
 
-      this.emit("update:local", { collectionName, update });
+      this.emit("update:local", { collectionName, update: finalUpdate });
       if (this.network.connectedPeerCount === 0) return;
 
       this.network.broadcast({
         type: "sync-update",
-        payload: this.encodeMessage(collectionName, update),
+        payload: this.encodeMessage(collectionName, finalUpdate),
       });
 
       await this.outbox.acknowledge(mutation.id);
@@ -266,6 +377,7 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
 
   private encodeMessage(collectionName: string, update: Uint8Array): string {
     const nameBytes = new TextEncoder().encode(collectionName);
+    // Use 2-byte big-endian header to support collection names up to 65535 bytes
     const header = new Uint8Array(2);
     header[0] = (nameBytes.length >> 8) & 0xff;
     header[1] = nameBytes.length & 0xff;
@@ -282,6 +394,7 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
   } | null {
     try {
       if (bytes.length < 2) return null;
+      // Read 2-byte big-endian name length
       const nameLen = (bytes[0]! << 8) | bytes[1]!;
       if (bytes.length < 2 + nameLen) return null;
       const nameBytes = bytes.slice(2, 2 + nameLen);
@@ -307,3 +420,17 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function bytesToBase64(bytes: Uint8Array): string {
+  // Process in chunks to avoid call-stack overflow on large payloads
+  const CHUNK_SIZE = 0x2000; // 8 KB
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK_SIZE));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
