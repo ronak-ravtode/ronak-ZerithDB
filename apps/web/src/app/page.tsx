@@ -693,7 +693,12 @@ export default function LandingPage() {
             <Link href="/pricing" className="hover:text-foreground transition-colors">
               Pricing
             </Link>
-            <a href="https://discord.gg/MhvuDvzWfF" target="_blank" rel="noopener noreferrer" className="hover:text-foreground transition-colors">
+            <a
+              href="https://discord.gg/MhvuDvzWfF"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hover:text-foreground transition-colors"
+            >
               Discord
             </a>
           </div>

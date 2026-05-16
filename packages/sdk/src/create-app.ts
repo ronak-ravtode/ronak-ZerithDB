@@ -1,5 +1,6 @@
 import { Logger } from "zerithdb-core";
 import type { ZerithDBConfig } from "zerithdb-core";
+import { MemoryCollector, estimateStorageBytes } from "zerithdb-devtools";
 import { ZerithDBError, ErrorCode } from "zerithdb-core";
 import { DbClient, CollectionClient } from "./db-client.js";
 import { SyncEngine } from "./sync-engine.js";
@@ -61,6 +62,7 @@ export interface ZerithDBApp {
  * const app = createApp({
  *   appId: "my-todo-app",
  *   sync: { signalingUrl: "wss://signal.zerithdb.dev" },
+ *   debug: { devtools: true },
  * });
  *
  * await app.db("todos").insert({ text: "Ship ZerithDB v1", done: false });
@@ -102,17 +104,31 @@ export function createApp(config: ZerithDBConfig): ZerithDBApp {
   const network = new NetworkManager(resolvedConfig, auth);
   const sync = new SyncEngine(resolvedConfig, db, network);
 
-  const collectionCache = new Map<string, CollectionClient<any>>();
-
+  let memoryCollector: MemoryCollector | null = null;
+  if (resolvedConfig.debug?.devtools === true) {
+    memoryCollector = new MemoryCollector({
+      measureIndexedDB: async () => {
+        const [totalBytes, dbStats] = await Promise.all([
+          estimateStorageBytes(),
+          db.getMemoryStats(),
+        ]);
+        return {
+          totalBytes,
+          recordCount: dbStats.recordCount,
+          collections: dbStats.collections,
+        };
+      },
+      measureWebRTC: () => network.getBufferStats(),
+    });
+    memoryCollector.start();
+  }
   return {
     config: Object.freeze(resolvedConfig),
 
     db<T extends Record<string, any>>(name: string): CollectionClient<T> {
-      if (!collectionCache.has(name)) {
-        collectionCache.set(name, db.collection(name));
-      }
-      // biome-ignore lint: cache guarantees this is defined
-      return collectionCache.get(name) as CollectionClient<T>;
+      // DbClient already caches collection instances internally —
+      // no need for a second cache layer here.
+      return db.collection<T>(name);
     },
 
     sync,
@@ -120,6 +136,7 @@ export function createApp(config: ZerithDBConfig): ZerithDBApp {
     network,
 
     async dispose(): Promise<void> {
+      memoryCollector?.stop();
       await Promise.all([sync.dispose(), network.dispose(), db.dispose()]);
     },
   };

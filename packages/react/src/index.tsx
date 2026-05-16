@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, useMemo } from "react";
+import React, { createContext, useContext, useEffect, useState, useMemo, useRef, useCallback } from "react";
 import { createApp } from "zerithdb-sdk";
 import type { ZerithDBApp, ZerithDBConfig, QueryFilter } from "zerithdb-sdk";
 import { liveQuery } from "dexie";
@@ -13,9 +13,19 @@ export interface ZerithProviderProps {
 /**
  * Global provider for ZerithDB.
  * Initializes the P2P client and makes it available via hooks.
+ * Disposes the previous client on config change or unmount to prevent
+ * memory/connection leaks.
  */
 export const ZerithProvider: React.FC<ZerithProviderProps> = ({ config, children }) => {
-  const client = useMemo(() => createApp(config), [JSON.stringify(config)]);
+  const configKey = JSON.stringify(config);
+  const client = useMemo(() => createApp(config), [configKey]);
+
+  // Dispose on unmount or when config changes (new client replaces old one)
+  useEffect(() => {
+    return () => {
+      void client.dispose();
+    };
+  }, [client]);
 
   return <ZerithContext.Provider value={client}>{children}</ZerithContext.Provider>;
 };
@@ -46,12 +56,12 @@ function useDeepCompareMemoize<T>(value: T) {
  * @param collectionName The name of the collection to query
  * @param filter A MongoDB-style query filter. Must be JSON-serializable.
  */
-export function useQuery<T extends Record<string, any>>(
+export function useQuery<T extends Record<string, any> = Record<string, any>>(
   collectionName: string,
   filter: QueryFilter<T> = {}
 ) {
   const app = useZerith();
-  const [data, setData] = useState<T[]>([]);
+  const [data, setData] = useState<(T & { _id: string })[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
 
@@ -66,11 +76,11 @@ export function useQuery<T extends Record<string, any>>(
 
     const subscription = observable.subscribe({
       next: (docs) => {
-        setData(docs as T[]);
+        setData(docs as (T & { _id: string })[]);
         setLoading(false);
       },
       error: (err) => {
-        setError(err);
+        setError(err instanceof Error ? err : new Error(String(err)));
         setLoading(false);
       },
     });
@@ -80,16 +90,20 @@ export function useQuery<T extends Record<string, any>>(
     };
   }, [app, collectionName, memoizedFilter]);
 
-  const insert = async (item: T) => {
-    return app.db<T>(collectionName).insert(item);
-  };
+  const insert = useCallback(
+    async (item: T) => {
+      return app.db<T>(collectionName).insert(item);
+    },
+    [app, collectionName]
+  );
 
-  const remove = async (id: string) => {
-    const collection = app.db<T>(collectionName);
-    type DeleteFilter = Parameters<typeof collection.delete>[0];
-    const deleteFilter = { _id: id } as unknown as DeleteFilter;
-    return collection.delete(deleteFilter);
-  };
+  const remove = useCallback(
+    async (id: string) => {
+      // delete() takes a QueryFilter, not a raw id string
+      return app.db<T>(collectionName).delete({ _id: id } as any);
+    },
+    [app, collectionName]
+  );
 
   return { data, loading, error, insert, remove };
 }

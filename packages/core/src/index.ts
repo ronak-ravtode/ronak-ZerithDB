@@ -5,7 +5,13 @@
 export { EventEmitter } from "./internal/event-emitter.js";
 export { ZerithDBError, ErrorCode } from "./internal/errors.js";
 export { Logger } from "./internal/logger.js";
-export type { ZerithDBConfig, SyncConfig, AuthConfig, NetworkConfig } from "./types/config.js";
+export type {
+  ZerithDBConfig,
+  SyncConfig,
+  AuthConfig,
+  NetworkConfig,
+  DebugConfig,
+} from "./types/config.js";
 export type {
   Document,
   DocumentId,
