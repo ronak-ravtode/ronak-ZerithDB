@@ -261,7 +261,7 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     });
 
     transport.onClose(() => {
-      if (!this.disposed) {
+      if (!this.disposed && this.config.network?.autoReconnect !== false) {
         this.scheduleReconnect(roomId);
       }
     });
@@ -331,9 +331,13 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     }
 
     peer.on("signal", (data) => {
+      // simple-peer fires 'signal' for offers, answers, AND trickle ICE candidates.
+      // We must use data.type to send the correct signaling message type.
+      const signalingType =
+        data.type === "offer" ? "offer" : data.type === "answer" ? "answer" : "ice-candidate";
       this.transport?.send(
         JSON.stringify({
-          type: initiator ? "offer" : "answer",
+          type: signalingType,
           from: this.localPeerId,
           to: remotePeerId,
           payload: data,

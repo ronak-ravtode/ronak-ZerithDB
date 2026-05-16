@@ -77,13 +77,30 @@ export interface ZerithDBApp {
  * app.sync.enable();
  * ```
  */
+
+function isIndexedDBAvailable(): boolean {
+  try {
+    return typeof indexedDB !== "undefined";
+  } catch {
+    return false;
+  }
+}
+
 export function createApp(config: ZerithDBConfig): ZerithDBApp {
+  if (!isIndexedDBAvailable()) {
+    throw new ZerithDBError(
+      ErrorCode.SDK_UNSUPPORTED_ENVIRONMENT,
+      "IndexedDB is unavailable in this browser environment. ZerithDB requires IndexedDB support. Try disabling private/incognito restrictions or use a supported browser."
+    );
+  }
+
   if (!config.appId || config.appId.trim().length === 0) {
     throw new ZerithDBError(
       ErrorCode.SDK_INVALID_CONFIG,
       'createApp requires a non-empty "appId" in config'
     );
   }
+
   const resolvedConfig: ZerithDBConfig = {
     logLevel: "warn",
     ...config,
@@ -112,8 +129,6 @@ export function createApp(config: ZerithDBConfig): ZerithDBApp {
   const network = new NetworkManager(resolvedConfig, auth);
   const sync = new SyncEngine(resolvedConfig, db, network);
 
-  const collectionCache = new Map<string, CollectionClient<any>>();
-
   let memoryCollector: MemoryCollector | null = null;
   if (resolvedConfig.debug?.devtools === true) {
     memoryCollector = new MemoryCollector({
@@ -139,11 +154,9 @@ export function createApp(config: ZerithDBConfig): ZerithDBApp {
     config: Object.freeze(resolvedConfig),
 
     db<T extends Record<string, any>>(name: string): CollectionClient<T> {
-      if (!collectionCache.has(name)) {
-        collectionCache.set(name, db.collection(name));
-      }
-      // biome-ignore lint: cache guarantees this is defined
-      return collectionCache.get(name) as CollectionClient<T>;
+      // DbClient already caches collection instances internally —
+      // no need for a second cache layer here.
+      return db.collection<T>(name);
     },
 
     sync,

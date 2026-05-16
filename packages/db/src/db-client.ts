@@ -8,7 +8,6 @@ import type {
   UpdateSpec,
 } from "zerithdb-core";
 import { ZerithDBError, ErrorCode } from "zerithdb-core";
-import type { BackupExportOptions, BackupSnapshot } from "./backup.js";
 
 /**
  * A handle to a single named collection within the ZerithDB local database.
@@ -162,6 +161,11 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
     }
   }
 
+  /** Alias for {@link clearAll} */
+  async clear(): Promise<void> {
+    return this.clearAll();
+  }
+
   /**
    * Count documents matching a filter.
    */
@@ -197,7 +201,17 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
         continue;
       }
 
+      // Distinguish operator objects ({ $gt: 3 }) from plain object values ({ key: "v" }).
+      // Only treat as operators if at least one key starts with "$".
       const conditions = condition as Record<string, any>;
+      const isOperatorObject = Object.keys(conditions).some((k) => k.startsWith("$"));
+
+      if (!isOperatorObject) {
+        // Deep equality check for plain object / array values
+        if (JSON.stringify(fieldValue) !== JSON.stringify(condition)) return false;
+        continue;
+      }
+
       if ("$eq" in conditions && fieldValue !== conditions["$eq"]) return false;
       if ("$ne" in conditions && fieldValue === conditions["$ne"]) return false;
       if ("$gt" in conditions && !((fieldValue as any) > (conditions["$gt"] as never))) return false;
@@ -257,12 +271,10 @@ class ZerithDBDexie extends Dexie {
  */
 export class DbClient {
   private readonly dexie: ZerithDBDexie;
-  private readonly appId: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly collections = new Map<string, CollectionClient<any>>();
 
   constructor(config: ZerithDBConfig) {
-    this.appId = config.appId;
     this.dexie = new ZerithDBDexie(config.appId);
   }
 
@@ -288,47 +300,6 @@ export class DbClient {
     }
 
     return { recordCount, collections };
-  }
-
-  /**
-   * Returns names of collections that have been opened in this session.
-   */
-  collectionNames(): string[] {
-    return Array.from(this.collections.keys());
-  }
-
-  /**
-   * Returns names of all collections currently stored in IndexedDB.
-   */
-  allCollectionNames(): string[] {
-    return this.dexie.tables.map((t) => t.name);
-  }
-
-  /**
-   * Export all collections to a JSON-serializable snapshot.
-   * If options.collections is omitted, it exports ALL collections found in IndexedDB.
-   */
-  async exportSnapshot(options: BackupExportOptions = {}): Promise<BackupSnapshot> {
-    const collectionNames = options.collections ?? this.allCollectionNames();
-    const collections: BackupSnapshot["collections"] = {};
-
-    try {
-      for (const name of collectionNames) {
-        const table = this.dexie.ensureCollection(name);
-        collections[name] = (await table.toArray()) as Document<Record<string, any>>[];
-      }
-    } catch (err) {
-      throw new ZerithDBError(ErrorCode.DB_READ_FAILED, "Failed to export local backup snapshot", {
-        cause: err,
-      });
-    }
-
-    return {
-      format: "zerithdb.local-backup.v1",
-      appId: this.appId,
-      generatedAt: new Date().toISOString(),
-      collections,
-    };
   }
 
   async dispose(): Promise<void> {
