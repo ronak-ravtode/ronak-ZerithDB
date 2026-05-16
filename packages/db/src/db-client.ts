@@ -7,7 +7,8 @@ import type {
   InsertResult,
   UpdateSpec,
 } from "zerithdb-core";
-import { ZerithDBError, ErrorCode } from "zerithdb-core";
+import { ErrorCode } from "zerithdb-core";
+import { wrapIDBOperation } from "./internal/wrap-idb-operation.js";
 
 /**
  * A handle to a single named collection within the ZerithDB local database.
@@ -33,16 +34,14 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       _updatedAt: now,
     };
 
-    try {
-      await this.table.add(doc);
-      return { id };
-    } catch (err) {
-      throw new ZerithDBError(
-        ErrorCode.DB_WRITE_FAILED,
-        `Failed to insert into collection "${this.collectionName}"`,
-        { cause: err }
-      );
-    }
+    return wrapIDBOperation(
+      ErrorCode.DB_WRITE_FAILED,
+      `Failed to insert into collection "${this.collectionName}"`,
+      async () => {
+        await this.table.add(doc);
+        return { id };
+      }
+    );
   }
 
   /**
@@ -57,16 +56,14 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       _updatedAt: now,
     })) as Document<T>[];
 
-    try {
-      await this.table.bulkAdd(docs);
-      return docs.map((d) => ({ id: d._id }));
-    } catch (err) {
-      throw new ZerithDBError(
-        ErrorCode.DB_WRITE_FAILED,
-        `Failed to bulk insert into collection "${this.collectionName}"`,
-        { cause: err }
-      );
-    }
+    return wrapIDBOperation(
+      ErrorCode.DB_WRITE_FAILED,
+      `Failed to bulk insert into collection "${this.collectionName}"`,
+      async () => {
+        await this.table.bulkAdd(docs);
+        return docs.map((d) => ({ id: d._id }));
+      }
+    );
   }
 
   /**
@@ -80,31 +77,25 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    * ```
    */
   async find(filter: QueryFilter<T> = {}): Promise<Document<T>[]> {
-    try {
-      const all = await this.table.toArray();
-      return all.filter((doc) => this.matchesFilter(doc, filter));
-    } catch (err) {
-      throw new ZerithDBError(
-        ErrorCode.DB_READ_FAILED,
-        `Failed to query collection "${this.collectionName}"`,
-        { cause: err }
-      );
-    }
+    return wrapIDBOperation(
+      ErrorCode.DB_READ_FAILED,
+      `Failed to query collection "${this.collectionName}"`,
+      async () => {
+        const all = await this.table.toArray();
+        return all.filter((doc) => this.matchesFilter(doc, filter));
+      }
+    );
   }
 
   /**
    * Find a single document by its `_id`.
    */
   async findById(id: string): Promise<Document<T> | undefined> {
-    try {
-      return await this.table.get(id);
-    } catch (err) {
-      throw new ZerithDBError(
-        ErrorCode.DB_READ_FAILED,
-        `Failed to get document "${id}" from "${this.collectionName}"`,
-        { cause: err }
-      );
-    }
+    return wrapIDBOperation(
+      ErrorCode.DB_READ_FAILED,
+      `Failed to get document "${id}" from "${this.collectionName}"`,
+      () => this.table.get(id)
+    );
   }
 
   /**
@@ -112,20 +103,16 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    * Returns the number of updated documents.
    */
   async update(filter: QueryFilter<T>, spec: UpdateSpec<T>): Promise<number> {
-    try {
-      const matches = await this.find(filter);
-      const now = Date.now();
-
-      await this.table.bulkPut(matches.map((doc) => this.applyUpdateSpec(doc, spec, now)));
-
-      return matches.length;
-    } catch (err) {
-      throw new ZerithDBError(
-        ErrorCode.DB_WRITE_FAILED,
-        `Failed to update documents in "${this.collectionName}"`,
-        { cause: err }
-      );
-    }
+    return wrapIDBOperation(
+      ErrorCode.DB_WRITE_FAILED,
+      `Failed to update documents in "${this.collectionName}"`,
+      async () => {
+        const matches = await this.find(filter);
+        const now = Date.now();
+        await this.table.bulkPut(matches.map((doc) => this.applyUpdateSpec(doc, spec, now)));
+        return matches.length;
+      }
+    );
   }
 
   /**
@@ -133,32 +120,26 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    * Returns the number of deleted documents.
    */
   async delete(filter: QueryFilter<T>): Promise<number> {
-    try {
-      const matches = await this.find(filter);
-      await this.table.bulkDelete(matches.map((d) => d._id));
-      return matches.length;
-    } catch (err) {
-      throw new ZerithDBError(
-        ErrorCode.DB_DELETE_FAILED,
-        `Failed to delete documents from "${this.collectionName}"`,
-        { cause: err }
-      );
-    }
+    return wrapIDBOperation(
+      ErrorCode.DB_DELETE_FAILED,
+      `Failed to delete documents from "${this.collectionName}"`,
+      async () => {
+        const matches = await this.find(filter);
+        await this.table.bulkDelete(matches.map((d) => d._id));
+        return matches.length;
+      }
+    );
   }
 
   /**
    * Delete every document in the collection.
    */
   async clearAll(): Promise<void> {
-    try {
-      await this.table.clear();
-    } catch (err) {
-      throw new ZerithDBError(
-        ErrorCode.DB_DELETE_FAILED,
-        `Failed to clear collection "${this.collectionName}"`,
-        { cause: err }
-      );
-    }
+    return wrapIDBOperation(
+      ErrorCode.DB_DELETE_FAILED,
+      `Failed to clear collection "${this.collectionName}"`,
+      () => this.table.clear()
+    );
   }
 
   /**
@@ -219,7 +200,6 @@ class ZerithDBDexie extends Dexie {
 
   ensureCollection(name: string): Table {
     if (!this.tableMap.has(name)) {
-      // Dexie requires version upgrade to add tables — we use a dynamic schema pattern
       const version = (this.verno ?? 0) + 1;
       const existingTableNames = this.tableMap.keys();
       const schema: Record<string, string> = { [name]: "_id, _createdAt, _updatedAt" };
