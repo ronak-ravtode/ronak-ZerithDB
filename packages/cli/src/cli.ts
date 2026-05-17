@@ -8,6 +8,7 @@ import { signalCommand } from "./commands/signal.js";
 import { lintCommand } from "./commands/lint.js";
 import { formatCommand } from "./commands/format.js";
 import { maintenanceCommand } from "./commands/maintenance.js";
+import { purgeCommand } from "./purge.js";
 
 import { checkConnectivity } from "./checkConnectivity.js";
 
@@ -68,6 +69,12 @@ async function main() {
     .command("maintenance <status>")
     .description("Toggle maintenance mode for the signaling server (on/off)")
     .action(maintenanceCommand);
+
+  // PURGE
+  program
+    .command("purge")
+    .description("Purge all local ZerithDB data stored in the home directory")
+    .action(purgeCommand);
 
   program.parse(process.argv);
 }
