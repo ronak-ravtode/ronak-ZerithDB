@@ -165,4 +165,5 @@ export default function BlogPage() {
         </div>
       </footer>
     </main>
- );
+  );
+}
